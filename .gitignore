@@ -1,0 +1,33 @@
+# system / home
+.*
+
+# exceptions (allow these)
+!.gitignore
+!requirements.txt
+!riemannian-fm/
+!HAE/
+!hyper_env.yaml
+!HAE/proj/extract_animalfaces.py
+
+# python
+__pycache__/
+*.pyc
+.ipynb_checkpoints/
+
+# data & outputs
+riemannian-fm/logs/
+riemannian-fm/outputs/
+
+.vscode/
+
+# some files used to create Appendix plot
+plotting_test.ipynb
+scaling_plot.pdf
+scaling_plot_dotted.pdf
+scaling_plot_log.pdf
+
+*.yaml
+output/
+slurm_output/
+failed_tasks/
+metrics_links/

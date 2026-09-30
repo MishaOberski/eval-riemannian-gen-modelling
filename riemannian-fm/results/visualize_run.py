@@ -1,0 +1,820 @@
+from __future__ import annotations
+
+import os
+import argparse
+import json
+import glob
+from dataclasses import dataclass
+from pathlib import Path
+from typing import Any
+import torch
+import numpy as np
+import matplotlib.pyplot as plt
+from omegaconf import OmegaConf
+from scipy.stats import gaussian_kde
+import pandas as pd
+
+
+
+BASE_DIR = Path(__file__).resolve().parent
+
+def get_metrics(run_dir, run_glob, out_dir, visualize=False, save=True, default_metrics=None):
+    run_dirs = collect_run_dirs(run_dir, run_glob)
+
+    if not run_dirs:
+        raise ValueError('No runs specified. Fill RUN_DIRS and/or RUN_GLOBS in the cell above.')
+
+    out_dir = Path(out_dir).expanduser()
+    if not out_dir.is_absolute():
+        out_dir = (BASE_DIR / out_dir).resolve()
+
+    metrics_list = {}
+    
+    
+    for i, run_dir in enumerate(run_dirs, start=1):
+        # metadata from run (manifold, curvature, dimension)
+        meta = load_general_from_hydra(run_dir)
+
+        paths = resolve_run_paths(run_dir)
+
+        missing = []
+        if not paths.run_dir.exists():
+            missing.append(f'missing run dir: {paths.run_dir}')
+        if not paths.artifacts_pt.exists():
+            missing.append(f'missing artifacts file: {paths.artifacts_pt}')
+        if not paths.metrics_json.exists():
+            missing.append(f'missing metrics file: {paths.metrics_json}')
+
+        if missing:
+            print('SKIP (missing files):')
+            for m in missing:
+                print(f'  - {m}')
+            continue
+
+        metrics = load_metrics(paths.metrics_json, meta)
+
+        label = safe_run_label(paths.run_dir)
+        out_file = out_dir / 'plots' / f'{label}_analysis.pdf'
+        out_file.parent.mkdir(parents=True, exist_ok=True)
+
+        if visualize:
+            visualize_pt_file(paths.artifacts_pt, run_dir=paths.run_dir, meta=meta, save_path=out_file)
+        metrics_list[label] = metrics
+    
+    if save:
+        pd.DataFrame(metrics_list).T.to_csv(f'{out_dir}/metrics.csv', index=True)
+        
+    return pd.DataFrame(metrics_list).T
+
+def find_visualize_script(start_dir: str | Path) -> Path:
+    """Locate visualize_run.py starting from a directory, searching up the tree.
+
+    This is mainly useful in notebooks/environments where the working directory
+    may differ from the directory containing this file.
+    """
+
+    start_dir_path = Path(start_dir).expanduser().resolve()
+    for base in [start_dir_path, *start_dir_path.parents]:
+        direct = base / "visualize_run.py"
+        in_results = base / "results" / "visualize_run.py"
+        if direct.exists():
+            return direct
+        if in_results.exists():
+            return in_results
+
+    raise FileNotFoundError(
+        "Could not locate visualize_run.py from the provided start directory. "
+        "Try opening/running from riemannian-fm/results/."
+    )
+
+
+@dataclass(frozen=True)
+class RunPaths:
+    run_dir: Path
+    artifacts_pt: Path
+    metrics_json: Path
+
+
+def resolve_run_paths(run_dir: str | Path, base_dir: Path | None = None) -> RunPaths:
+    """Resolve a run directory into expected artifact/metric paths."""
+
+    base_dir = base_dir or BASE_DIR
+    run_dir_path = Path(run_dir).expanduser()
+    if not run_dir_path.is_absolute():
+        run_dir_path = base_dir / run_dir_path
+    run_dir_path = run_dir_path.resolve()
+
+    artifacts_pt = run_dir_path / "artifacts" / "final_fixed_eval_outputs.pt"
+    metrics_json = run_dir_path / "metrics.json"
+    return RunPaths(run_dir=run_dir_path, artifacts_pt=artifacts_pt, metrics_json=metrics_json)
+
+
+def collect_run_dirs(
+    run_dirs: list[str | Path],
+    run_globs: list[str],
+    base_dir: Path | None = None,
+) -> list[Path]:
+    """Collect run directories from explicit paths and/or glob patterns."""
+
+    base_dir = base_dir or BASE_DIR
+    collected: list[Path] = []
+
+    for rd in run_dirs:
+        collected.append(Path(rd).expanduser())
+
+    for pattern in run_globs:
+        # Globs are interpreted relative to base_dir unless absolute.
+        if Path(pattern).is_absolute():
+            matches = [Path(p) for p in glob.glob(pattern)]
+        else:
+            matches = list(base_dir.glob(pattern))
+        collected.extend(sorted(matches))
+
+    # Deduplicate while preserving order
+    seen: set[Path] = set()
+    unique: list[Path] = []
+    for p in collected:
+        if p not in seen:
+            unique.append(p)
+            seen.add(p)
+
+    return unique
+
+
+def safe_run_label(run_dir: str | Path) -> str:
+    """Build a short label for filenames (e.g. baseline__poi_d3_c1)."""
+
+    run_dir_path = Path(run_dir)
+    parts = [run_dir_path.parent.name, run_dir_path.name]
+    label = "__".join([p for p in parts if p])
+    return label or run_dir_path.name
+
+
+def load_metrics(metrics_path: str | Path, meta: dict) -> dict:
+    metrics_path = Path(metrics_path).expanduser().resolve()
+    with metrics_path.open("r", encoding="utf-8") as f:
+        metrics = json.load(f)
+    # Merge metadata into metrics
+    for k, v in meta.items():
+        metrics[f"{k}"] = v
+    return metrics
+
+
+def print_metrics(metrics: dict, key_subset: list[str] | None = None) -> None:
+    if key_subset is not None and key_subset != []:
+        print("Key metrics:")
+        for k, v in metrics.items():
+            if k in key_subset:
+                print(f"  {k}: {v}")
+    else:
+        print("\nAll metrics (sorted):")
+        for k in sorted(metrics.keys()):
+            print(f"  {k}: {metrics[k]}")
+
+
+def load_general_from_hydra(run_dir: str | Path) -> dict:
+    run_dir = Path(run_dir).expanduser().resolve()
+    cfg_path = run_dir / ".hydra" / "config.yaml"
+    cfg = OmegaConf.load(str(cfg_path))
+    general = cfg.get("general")
+    return OmegaConf.to_container(general, resolve=True) if general is not None else {}
+
+def extract_data(data):
+    """Safely extract and convert PyTorch tensors to numpy arrays."""
+    return {
+        "x0": data["eval_x0"].numpy(),
+        "x1": data["eval_x1"].numpy(),
+        "x1_hat": data["x1_hat"].numpy(),
+        "x_t": data["x_t"].numpy(),  # Shape: (T, N, D)
+        "u_t": data["u_t"].numpy(),
+        "vtheta": data["vtheta"].numpy(),
+        "eval_t": data["eval_t"].numpy(),
+    }
+
+
+def format_title(meta, subtitle):
+    """Formats the title to include metadata for easy verification."""
+    meta_str = " | ".join(
+        [
+            f"{k}: {v}"
+            for k, v in meta.items()
+            if k != "cfg_yaml" and not isinstance(v, (list, tuple, dict))
+        ]
+    )
+    return f"\n\n\n{subtitle}\n{meta_str}"
+
+
+def plot_euclidean(data_dict, meta, save_path=None):
+    """Standard 2D Euclidean Plotting"""
+    d = data_dict
+    fig, axes = plt.subplots(1, 3, figsize=(18, 6))
+    fig.suptitle(format_title(meta, "Euclidean Flow Matching"), fontsize=12, y=1.05)
+
+    # Panel 1: Distributions
+    axes[0].scatter(d["x0"][:, 0], d["x0"][:, 1], c="gray", alpha=0.3, label="Source (x0)", s=10)
+    axes[0].scatter(
+        d["x1"][:, 0], d["x1"][:, 1], c="blue", alpha=0.5, label="True Target (x1)", s=15
+    )
+    axes[0].scatter(
+        d["x1_hat"][:, 0], d["x1_hat"][:, 1], c="red", alpha=0.5, label="Generated (x1_hat)", s=15
+    )
+    axes[0].set_title("Distribution Matching")
+    axes[0].legend()
+    axes[0].axis("equal")
+
+    # Panel 2: Trajectories
+    axes[1].scatter(d["x0"][:, 0], d["x0"][:, 1], c="gray", s=10)
+    axes[1].scatter(d["x1"][:, 0], d["x1"][:, 1], c="blue", s=10)
+    for n in range(min(50, d["x_t"].shape[1])):
+        axes[1].plot(d["x_t"][:, n, 0], d["x_t"][:, n, 1], c="black", alpha=0.3, linewidth=1)
+    axes[1].set_title("True Geodesic Trajectories")
+    axes[1].axis("equal")
+
+    # Panel 3: Vector Field
+    mid_idx = len(d["eval_t"]) // 2
+    axes[2].quiver(
+        d["x_t"][mid_idx, :, 0],
+        d["x_t"][mid_idx, :, 1],
+        d["u_t"][mid_idx, :, 0],
+        d["u_t"][mid_idx, :, 1],
+        color="blue",
+        alpha=0.5,
+        label="True Field (u_t)",
+    )
+    axes[2].quiver(
+        d["x_t"][mid_idx, :, 0],
+        d["x_t"][mid_idx, :, 1],
+        d["vtheta"][mid_idx, :, 0],
+        d["vtheta"][mid_idx, :, 1],
+        color="red",
+        alpha=0.5,
+        label="Predicted (vtheta)",
+    )
+    axes[2].set_title(f"Field Alignment at t={d['eval_t'][mid_idx]:.2f}")
+    axes[2].legend()
+    axes[2].axis("equal")
+
+    plt.tight_layout()
+    if save_path:
+        plt.savefig(save_path, bbox_inches="tight")
+    else:
+        plt.show()
+
+
+
+def plot_poincare(data_dict, meta, save_path=None):
+    """Replicates the codebase's plot_poincare style with the bounding circle."""
+    d = data_dict
+    fig, axes = plt.subplots(1, 5, figsize=(30, 6))
+    fig.suptitle(format_title(meta, "Poincaré Disk Flow Matching"), fontsize=12, y=1.05)
+
+    for ax in axes:
+        ax.add_patch(plt.Circle((0, 0), 1.0, color="k", fill=False))
+        ax.set_xlim([-1.1, 1.1])
+        ax.set_ylim([-1.1, 1.1])
+        ax.set_aspect("equal")
+        ax.axis("off")
+    
+    #Removing points from x1_hat that are outside the unit disk (due to numerical issues)
+    mask = np.linalg.norm(d["x1_hat"], axis=-1) < 1.0
+    n_removed = (~mask).sum()
+    if n_removed > 0: #logging a warning if any points were removed
+        print(f"Warning: Removed {n_removed} points from x1_hat that were outside the unit disk.")
+    x1_hat = d["x1_hat"][mask]
+
+
+    #KDE helper
+    def disk_kde(points, resolution=100):
+        kde = gaussian_kde(points.T)
+        grid_x, grid_y = np.mgrid[-1:1:resolution*1j, -1:1:resolution*1j]
+        inside = (grid_x**2 + grid_y**2) < 1.0
+        z = kde(np.vstack([grid_x.ravel(),grid_y.ravel()])).reshape(resolution,resolution)
+        z[~inside] = np.nan
+        return grid_x,grid_y,z
+
+    # Panel 1: Distributions
+    axes[0].scatter(d["x0"][:, 0], d["x0"][:, 1], c="gray", alpha=0.3, label="Source", s=10)
+    axes[0].scatter(d["x1"][:, 0], d["x1"][:, 1], c="blue", alpha=0.5, label="True Target", s=15)
+    axes[0].scatter(
+        x1_hat[:, 0], x1_hat[:, 1], c="red", alpha=0.5, label="Generated", s=15
+    )
+    axes[0].set_title("Distribution Matching")
+    axes[0].legend(loc="upper right")
+
+    # Panel 2: Trajectories
+    axes[1].scatter(d["x0"][:, 0], d["x0"][:, 1], c="gray", s=10)
+    axes[1].scatter(d["x1"][:, 0], d["x1"][:, 1], c="blue", s=10)
+    for n in range(min(100, d["x_t"].shape[1])):
+        axes[1].plot(d["x_t"][:, n, 0], d["x_t"][:, n, 1], color="grey", linewidth=0.5)
+    axes[1].set_title("Geodesic Trajectories")
+
+    # Panel 3: Vector Field
+    mid_idx = len(d["eval_t"]) // 2
+    axes[2].quiver(
+        d["x_t"][mid_idx, :, 0],
+        d["x_t"][mid_idx, :, 1],
+        d["u_t"][mid_idx, :, 0],
+        d["u_t"][mid_idx, :, 1],
+        color="blue",
+        alpha=0.5,
+        label="u_t",
+    )
+    axes[2].quiver(
+        d["x_t"][mid_idx, :, 0],
+        d["x_t"][mid_idx, :, 1],
+        d["vtheta"][mid_idx, :, 0],
+        d["vtheta"][mid_idx, :, 1],
+        color="red",
+        alpha=0.5,
+        label="vtheta",
+    )
+    axes[2].set_title(f"Field Alignment at t={d['eval_t'][mid_idx]:.2f}")
+    axes[2].legend(loc="upper right")
+
+    #panel 4: KDE overlay
+    gx, gy, z_true = disk_kde(d["x1"])
+    gx,gy,z_hat = disk_kde(x1_hat)
+    axes[3].contourf(gx,gy,z_true, levels=6, colors=["blue"], alpha=0.2)
+    axes[3].contour(gx,gy,z_true, levels=6, colors=["blue"], linewidths = 0.8, label="True")
+    axes[3].contourf(gx,gy,z_hat, levels=6, colors=["red"], alpha=0.2)
+    axes[3].contour(gx,gy,z_hat, levels=6, colors=["red"], linewidths = 0.8, label="Generated")
+    axes[3].set_title("Density Estimation (KDE): True vs Generated")
+    axes[3].legend(handles=[
+        plt.Line2D([0], [0], color="blue", label="True"),
+        plt.Line2D([0], [0], color="red", label="Generated")
+    ],loc ="upper right")
+
+
+
+    #Difference of KDEs
+    vmax = max(np.nanmax(np.abs(z_true)), np.nanmax(np.abs(z_hat))) # positive: under generates, negetive: over generates
+    z_diff = (z_true - z_hat) 
+    if not np.isfinite(vmax) or vmax == 0:
+        axes[4].set_title("KDE Difference (unavailable)")
+    else:
+        z_diff= z_diff/vmax
+        im = axes[4].contourf(gx, gy, z_diff, levels=12, cmap="RdBu", vmin=-1, vmax=1)
+        axes[4].set_title("KDE Difference (True − Generated)")
+        plt.colorbar(im, ax=axes[4], fraction=0.046, pad=0.04)
+
+    plt.tight_layout()
+    if save_path:
+        plt.savefig(save_path, bbox_inches="tight")
+    else:
+        plt.show()
+
+
+def plot_sphere_2d(data_dict, meta, save_path=None):
+    """Plots a 1D circle embedded in 2D space."""
+    d = data_dict
+    curvature = meta.get("curvature", 1.0)
+    R = 1.0 / np.sqrt(curvature) if curvature > 0 else 1.0
+
+    fig, axes = plt.subplots(1, 5, figsize=(30, 6))
+    fig.suptitle(
+        format_title(meta, f"1D Spherical Flow Matching (S1 in R2, R={R:.2f})"), fontsize=12, y=1.05
+    )
+
+    for ax in axes[:3]:
+        # Draw the 2D circular boundary
+        ax.add_patch(
+            plt.Circle((0, 0), R, color="lightblue", fill=False, linewidth=2, linestyle="--")
+        )
+        ax.set_xlim([-R * 1.2, R * 1.2])
+        ax.set_ylim([-R * 1.2, R * 1.2])
+        ax.set_aspect("equal")
+        ax.axis("off")
+
+    for ax in axes[3:]:
+        ax.axis("on")
+        ax.set_aspect("auto")
+    # Panel 1: Distributions
+    axes[0].scatter(d["x0"][:, 0], d["x0"][:, 1], c="gray", alpha=0.5, label="Source", s=10)
+    axes[0].scatter(d["x1"][:, 0], d["x1"][:, 1], c="blue", alpha=0.5, label="True Target", s=15)
+    axes[0].scatter(
+        d["x1_hat"][:, 0], d["x1_hat"][:, 1], c="red", alpha=0.5, label="Generated", s=15
+    )
+    axes[0].set_title("Distribution Matching")
+    axes[0].legend(loc="upper right")
+    axes[0].add_patch(
+            plt.Circle((0, 0), R, color="lightblue", fill=False, linewidth=2, linestyle="--")
+        )
+    axes[0].set_xlim([-R * 1.2, R * 1.2])
+    axes[0].set_ylim([-R * 1.2, R * 1.2])
+    axes[0].set_aspect("equal")
+    axes[0].axis("off")
+
+    # Panel 2: Trajectories
+    axes[1].scatter(d["x0"][:, 0], d["x0"][:, 1], c="gray", s=10, zorder=3)
+    axes[1].scatter(d["x1"][:, 0], d["x1"][:, 1], c="blue", s=10, zorder=3)
+    for n in range(min(50, d["x_t"].shape[1])):
+        axes[1].plot(
+            d["x_t"][:, n, 0], d["x_t"][:, n, 1], color="grey", alpha=0.5, linewidth=1, zorder=1
+        )
+    axes[1].set_title("Geodesic Trajectories")
+    axes[1].add_patch(
+            plt.Circle((0, 0), R, color="lightblue", fill=False, linewidth=2, linestyle="--")
+        )
+    axes[1].set_xlim([-R * 1.2, R * 1.2])
+    axes[1].set_ylim([-R * 1.2, R * 1.2])
+    axes[1].set_aspect("equal")
+    axes[1].axis("off")
+
+    # Panel 3: Vector Field
+    mid_idx = len(d["eval_t"]) // 2
+    idx = np.random.choice(d["x_t"].shape[1], min(30, d["x_t"].shape[1]), replace=False)
+    xt_m, ut_m, vt_m = d["x_t"][mid_idx][idx], d["u_t"][mid_idx][idx], d["vtheta"][mid_idx][idx]
+
+    axes[2].quiver(
+        xt_m[:, 0],
+        xt_m[:, 1],
+        ut_m[:, 0],
+        ut_m[:, 1],
+        color="blue",
+        alpha=0.5,
+        label="u_t",
+        zorder=2,
+    )
+    axes[2].quiver(
+        xt_m[:, 0],
+        xt_m[:, 1],
+        vt_m[:, 0],
+        vt_m[:, 1],
+        color="red",
+        alpha=0.5,
+        label="vtheta",
+        zorder=3,
+    )
+    axes[2].set_title(f"Field Alignment (t={d['eval_t'][mid_idx]:.2f})")
+    axes[2].legend(loc="upper right")
+    axes[2].add_patch(
+            plt.Circle((0, 0), R, color="lightblue", fill=False, linewidth=2, linestyle="--")
+        )
+    axes[2].set_xlim([-R * 1.2, R * 1.2])
+    axes[2].set_ylim([-R * 1.2, R * 1.2])
+    axes[2].set_aspect("equal")
+    axes[2].axis("off")
+    # Panel 4 & 5: 1D KDE in angle space, wrapped onto circle as filled band
+    def angle_kde(points, resolution=500):
+        angles = np.arctan2(points[:, 1], points[:, 0])
+        kde = gaussian_kde(angles)
+        grid = np.linspace(-np.pi, np.pi, resolution)
+        return grid, kde(grid)
+
+    def draw_kde_band(ax, grid, z, color, vmax, scale=0.4, alpha_fill=0.3, lw=1.5):
+        z_based = z - np.min(z)
+        z_norm  = (z_based / vmax) * scale * R  # shared vmax, not per-distribution
+        r_outer = R + z_norm
+        x_inner = R       * np.cos(grid)
+        y_inner = R       * np.sin(grid)
+        x_outer = r_outer * np.cos(grid)
+        y_outer = r_outer * np.sin(grid)
+        x_poly  = np.concatenate([x_outer, x_inner[::-1]])
+        y_poly  = np.concatenate([y_outer, y_inner[::-1]])
+        ax.fill(x_poly, y_poly, color=color, alpha=alpha_fill)
+        ax.plot(x_outer, y_outer, color=color, linewidth=lw)
+
+    def finalize_circle(ax):
+        ax.add_patch(plt.Circle((0, 0), R, color="white", zorder=3))
+        ax.add_patch(plt.Circle((0, 0), R, color="black", fill=False, linewidth=1.5, zorder=4))
+        ax.set_xlim([-R * 1.6, R * 1.6])
+        ax.set_ylim([-R * 1.6, R * 1.6])
+        ax.set_aspect("equal")
+        ax.axis("off")
+
+    grid, z_true_1d = angle_kde(d["x1"])
+    grid, z_hat_1d  = angle_kde(d["x1_hat"])
+
+    z_true_based = z_true_1d - np.min(z_true_1d)
+    z_hat_based  = z_hat_1d  - np.min(z_hat_1d)
+    vmax = max(np.nanmax(z_true_based), np.nanmax(z_hat_based))
+
+    draw_kde_band(axes[3], grid, z_true_1d, color="blue", vmax=vmax)
+    draw_kde_band(axes[3], grid, z_hat_1d,  color="red", vmax=vmax)
+    finalize_circle(axes[3])
+    axes[3].set_title("Density Estimation (KDE): True vs Generated")
+    axes[3].legend(handles=[
+        plt.Line2D([0], [0], color="blue", label="True"),
+        plt.Line2D([0], [0], color="red",  label="Generated"),
+    ], loc="upper right")
+
+    vmax = max(np.nanmax(np.abs(z_true_1d)), np.nanmax(np.abs(z_hat_1d)))
+    if not np.isfinite(vmax) or vmax == 0:
+        axes[4].set_title("KDE Difference (unavailable)")
+    else:
+        z_diff = (z_true_1d - z_hat_1d) / vmax
+        scale  = 0.4 * R
+        x_ref  = R * np.cos(grid)
+        y_ref  = R * np.sin(grid)
+
+        for sign, color in [(1, "blue"), (-1, "red")]:
+            z_signed = np.where(z_diff * sign > 0, z_diff * sign, 0.0)
+            r_band   = R + z_signed * scale / np.nanmax(np.abs(z_diff))
+            x_poly   = np.concatenate([r_band * np.cos(grid), x_ref[::-1]])
+            y_poly   = np.concatenate([r_band * np.sin(grid), y_ref[::-1]])
+            axes[4].fill(x_poly, y_poly, color=color, alpha=0.4)
+
+        r_diff_curve = R + z_diff * scale / np.nanmax(np.abs(z_diff))
+        axes[4].plot(r_diff_curve * np.cos(grid), r_diff_curve * np.sin(grid), color="gray", linewidth=0.8)
+        finalize_circle(axes[4])
+        axes[4].set_title("KDE Difference (True − Generated)")
+        axes[4].legend(handles=[
+            plt.Line2D([0], [0], color="blue", label="Under-generated"),
+            plt.Line2D([0], [0], color="red",  label="Over-generated"),
+        ], loc="upper right")
+
+    plt.tight_layout()
+    if save_path:
+        plt.savefig(save_path, bbox_inches="tight")
+    else:
+        plt.show()
+
+
+def plot_sphere_3d(data_dict, meta, save_path=None):
+    """Plots a 2D surface embedded in 3D space with a wireframe."""
+    d = data_dict
+    curvature = meta.get("curvature", 1.0)
+    R = 1.0 / np.sqrt(curvature) if curvature > 0 else 1.0
+
+    fig = plt.figure(figsize=(18, 6))
+    fig.suptitle(
+        format_title(meta, f"2D Spherical Flow Matching (S2 in R3, R={R:.2f})"), fontsize=12, y=1.05
+    )
+
+    axes = [
+        fig.add_subplot(151, projection="3d"),
+        fig.add_subplot(152, projection="3d"),
+        fig.add_subplot(153, projection="3d"),
+        fig.add_subplot(154, projection="3d"),
+        fig.add_subplot(155, projection="3d"),
+    ]
+
+    # Draw the wireframe sphere on all panels
+    u = np.linspace(0, 2 * np.pi, 30)
+    v = np.linspace(0, np.pi, 30)
+    u, v = np.meshgrid(u, v)
+    xs = R * np.cos(u) * np.sin(v)
+    ys = R * np.sin(u) * np.sin(v)
+    zs = R * np.cos(v)
+
+    for ax in axes:
+        ax.plot_wireframe(xs, ys, zs, color="lightblue", alpha=0.1, linewidth=0.5)
+        ax.set_xlim([-R, R])
+        ax.set_ylim([-R, R])
+        ax.set_zlim([-R, R])
+        ax.set_box_aspect([1, 1, 1])
+        ax.axis("off")
+
+        ax.view_init(elev=45, azim=180)
+
+    # Panel 1: Distributions
+    axes[0].scatter(
+        d["x0"][:, 0], d["x0"][:, 1], d["x0"][:, 2], c="gray", alpha=0.3, label="Source"
+    )
+    axes[0].scatter(
+        d["x1"][:, 0], d["x1"][:, 1], d["x1"][:, 2], c="blue", alpha=0.5, label="True Target"
+    )
+    axes[0].scatter(
+        d["x1_hat"][:, 0],
+        d["x1_hat"][:, 1],
+        d["x1_hat"][:, 2],
+        c="red",
+        alpha=0.5,
+        label="Generated",
+    )
+    axes[0].set_title("Distribution Matching")
+    axes[0].legend()
+
+    # Panel 2: Trajectories
+    for n in range(min(50, d["x_t"].shape[1])):
+        axes[1].plot(
+            d["x_t"][:, n, 0],
+            d["x_t"][:, n, 1],
+            d["x_t"][:, n, 2],
+            color="grey",
+            alpha=0.5,
+            linewidth=1,
+        )
+    axes[1].set_title("Geodesic Trajectories")
+
+    # Panel 3: Vector Field
+    mid_idx = len(d["eval_t"]) // 2
+    idx = np.random.choice(d["x_t"].shape[1], min(30, d["x_t"].shape[1]), replace=False)
+    xt_m, ut_m, vt_m = d["x_t"][mid_idx][idx], d["u_t"][mid_idx][idx], d["vtheta"][mid_idx][idx]
+
+    axes[2].quiver(
+        xt_m[:, 0],
+        xt_m[:, 1],
+        xt_m[:, 2],
+        ut_m[:, 0],
+        ut_m[:, 1],
+        ut_m[:, 2],
+        color="blue",
+        alpha=0.5,
+        label="u_t",
+        length=R * 0.2,
+        normalize=True,
+    )
+    axes[2].quiver(
+        xt_m[:, 0],
+        xt_m[:, 1],
+        xt_m[:, 2],
+        vt_m[:, 0],
+        vt_m[:, 1],
+        vt_m[:, 2],
+        color="red",
+        alpha=0.5,
+        label="vtheta",
+        length=R * 0.2,
+        normalize=True,
+    )
+    axes[2].set_title(f"Field Alignment (t={d['eval_t'][mid_idx]:.2f})")
+    axes[2].legend()
+
+    def to_spherical(points):
+        x = points[:, 0]
+        y = points[:, 1]
+        z = points[:, 2]
+
+
+        theta = np.arctan2(y, x)  # [-pi, pi]
+        phi = np.arccos(np.clip(z / R, -1.0, 1.0))  # [0, pi]
+
+
+        return np.stack([theta, phi], axis=1)
+
+
+    def sphere_kde_cartesian(points, resolution=80, kappa=25.0):
+        """
+        Spherical KDE using a von Mises–Fisher-style kernel.
+
+        points: (N,3) points on sphere
+        kappa: concentration parameter
+            larger = sharper density
+        """
+
+        # Normalize points onto sphere
+        points = points / np.linalg.norm(points, axis=1, keepdims=True)
+
+        phi = np.linspace(0, np.pi, resolution)
+        theta = np.linspace(0, 2 * np.pi, resolution)
+
+        theta, phi = np.meshgrid(theta, phi)
+
+        xs = R * np.cos(theta) * np.sin(phi)
+        ys = R * np.sin(theta) * np.sin(phi)
+        zs = R * np.cos(phi)
+
+        # Grid points on sphere
+        grid_points = np.stack(
+            [
+                xs.ravel(),
+                ys.ravel(),
+                zs.ravel(),
+            ],
+            axis=1,
+        )
+
+        # Normalize grid points
+        grid_points = grid_points / np.linalg.norm(
+            grid_points,
+            axis=1,
+            keepdims=True,
+        )
+
+        # Cosine similarity = spherical inner product
+        dots = grid_points @ points.T
+
+        # von Mises–Fisher-like kernel
+        density = np.exp(kappa * dots).sum(axis=1)
+
+        # Normalize
+        density /= density.max() + 1e-8
+
+        density = density.reshape(xs.shape)
+
+        return xs, ys, zs, density
+
+
+    xs, ys, zs, z_true = sphere_kde_cartesian(d["x1"])
+    _, _, _, z_hat = sphere_kde_cartesian(d["x1_hat"])
+
+    z_true = np.nan_to_num(z_true)
+    z_hat = np.nan_to_num(z_hat)
+
+    vmax = max(
+        np.nanmax(z_true),
+        np.nanmax(z_hat),
+        1e-8,
+    )
+
+    # Panel 4: KDE true/generated overlay
+    axes[3].plot_surface(
+        xs,
+        ys,
+        zs,
+        facecolors=plt.cm.Blues(z_true / vmax),
+        rstride=1,
+        cstride=1,
+        linewidth=0,
+        antialiased=False,
+        alpha=0.7,
+    )
+
+    axes[3].plot_surface(
+        xs,
+        ys,
+        zs,
+        facecolors=plt.cm.Reds(z_hat / vmax),
+        rstride=1,
+        cstride=1,
+        linewidth=0,
+        antialiased=False,
+        alpha=0.4,
+    )
+
+    axes[3].set_title("Density Estimation (KDE)")
+    axes[3].set_box_aspect([1, 1, 1])
+    axes[3].axis("off")
+
+    # Panel 5: KDE difference
+    z_diff = (z_true - z_hat) / vmax
+
+    surf = axes[4].plot_surface(
+        xs,
+        ys,
+        zs,
+        facecolors=plt.cm.RdBu((z_diff + 1) / 2),
+        rstride=1,
+        cstride=1,
+        linewidth=0,
+        antialiased=False,
+    )
+
+    axes[4].set_title("KDE Difference (True − Generated)")
+    axes[4].set_box_aspect([1, 1, 1])
+    axes[4].axis("off")
+
+
+    
+    plt.tight_layout()
+    if save_path:
+        plt.savefig(save_path, bbox_inches="tight")
+    else:
+        plt.show()
+
+
+def visualize_pt_file(pt_file: str | Path, run_dir: str | Path, meta: dict, save_path: str | Path | None = None) -> dict:
+    """Load a saved eval .pt file and generate the appropriate plot.
+    """
+
+    pt_path = Path(pt_file).expanduser().resolve()
+    if not pt_path.exists():
+        raise FileNotFoundError(f"Eval outputs not found: {pt_path}")
+
+    raw_data = torch.load(pt_path, map_location="cpu", weights_only=True)
+    data = extract_data(raw_data)
+
+    manifold_type = meta.get("manifold", "").lower()
+    dim = data["x0"].shape[1]
+
+    save_path_str = str(Path(save_path)) if save_path is not None else None
+
+    if "poincare" in manifold_type:
+        if dim == 2:
+            plot_poincare(data, meta, save_path_str)
+    elif "sphere" in manifold_type:
+        if dim == 2:
+            plot_sphere_2d(data, meta, save_path_str)
+        elif dim == 3:
+            plot_sphere_3d(data, meta, save_path_str)
+    else:
+        if dim == 2:
+            plot_euclidean(data, meta, save_path_str)
+
+    return meta
+
+
+def main():
+    # fmt: off
+    parser = argparse.ArgumentParser(description="Visualize Geometric Flow Matching Results")
+    parser.add_argument("--file", "-f", required=True, help="Path to the .pt file")
+    parser.add_argument("--run-dir", "-r", required=True, help="Path to the run directory")
+    parser.add_argument("--save", "-s", action="store_true", help="Save the plot to a file")
+    parser.add_argument("--out", "-o", default=".results/images/run_analysis.png", help="Output filename if saving")
+
+    args = parser.parse_args()
+    meta = load_general_from_hydra(args.run_dir)
+    # fmt: on
+
+    if not os.path.exists(args.file):
+        print(f"Error: File '{args.file}' not found.")
+        return
+
+    save_path = args.out if args.save else None
+    print(f"Loading data from {args.file}...")
+    visualize_pt_file(args.file, args.run_dir, meta=meta, save_path=save_path)
+
+
+if __name__ == "__main__":
+    main()

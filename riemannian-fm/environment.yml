@@ -1,0 +1,35 @@
+name: manifm
+channels:
+  - conda-forge
+  - nvidia
+dependencies:
+  - python=3.9
+  - igl
+  - meshplot
+  - matplotlib
+  - jupyter
+  - numpy
+  - pandas
+  - pip
+  - tqdm
+  - torchmetrics
+  - geopandas
+  - pip:
+    - submitit
+    - pre-commit
+    - black==22.6.0
+    - ipykernel
+    - torchdiffeq
+    - scikit-learn
+    - pytorch-lightning==1.8.5.post0
+    - torchdiffeq
+    - hydra-core==1.2.0
+    - hydra-submitit-launcher==1.2.0
+    - hydra_colorlog==1.2.0
+    - click
+    - wandb
+    - geoopt
+    - geomloss==0.2.6
+    - biopython
+    - pyevtk
+    - ipympl
